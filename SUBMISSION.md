@@ -166,19 +166,22 @@ declare the **list of difficulties** you want scored and the checkpoint for each
 ```yaml
 team: "team-name"
 policy: warehouse_sort.il_policy:load_dp       # obs→action entrypoint
+obs_mode: state                                # state (main) or rgb (image track); default state
 
 levels:                                        # declare only the levels you want scored
-  easy:   { checkpoint: <path-to-ckpt> }
-  medium: { checkpoint: <path-to-ckpt> }
-  hard:   { checkpoint: <path-to-ckpt> }
+  easy:   { checkpoint: <path-to-easy-ckpt> }
+  medium: { checkpoint: <path-to-medium-ckpt> }
+  hard:   { checkpoint: <path-to-hard-ckpt> }
 ```
 
 - **List of difficulties** = the keys under `levels`. Omit a level → it scores 0
   (but its weight still counts: easy 0.2, medium 0.3, hard 0.5).
 - **checkpoint** — the state vector is parcel-count-specific, so train and point at **one
   checkpoint per level** (easy/medium/hard each have their own).
-- **policy** can be overridden per level (e.g. a different approach on hard only).
-- The main track is **state**; for the optional image track use `load_dp_rgb`.
+- **obs_mode** — `state` (main track, default) or `rgb` (optional image track). The judge runs
+  the env in this mode, so it must match what your policy expects.
+- **policy** can be overridden per level (e.g. a different approach on hard only). For the image
+  track set `policy: …:load_dp_rgb` and `obs_mode: rgb`.
 
 ## Scoring
 
