@@ -29,7 +29,7 @@ def _add_baseline_path(rel):
 # --------------------------------------------------------------------------- #
 class _DPPolicy:
     def __init__(self, net, scheduler, obs_horizon, pred_horizon, act_dim, device,
-                 num_inference_steps=16):
+                 num_inference_steps=16, obs_mean=None, obs_std=None):
         self.net = net.to(device).eval()
         self.scheduler = scheduler
         self.scheduler.set_timesteps(num_inference_steps)
@@ -38,17 +38,26 @@ class _DPPolicy:
         self.act_dim = act_dim
         self.device = device
         self.prev = None
+        # Normalization stats (None → identity, i.e. no normalisation for old checkpoints)
+        self.obs_mean = obs_mean.to(device) if obs_mean is not None else None
+        self.obs_std  = obs_std.to(device)  if obs_std  is not None else None
 
     @torch.no_grad()
     def act(self, obs, deterministic=True):
+        # cur is always stored UN-normalised so we don't double-normalise across steps
         cur = (obs["state"] if isinstance(obs, dict) else obs).float().to(self.device)
         if self.prev is None or self.prev.shape != cur.shape:
             self.prev = cur
         hist = [self.prev, cur][-self.obs_horizon:]
         while len(hist) < self.obs_horizon:
             hist = [hist[0]] + hist
-        self.prev = cur
-        obs_cond = torch.stack(hist, dim=1).flatten(start_dim=1)
+        self.prev = cur  # save raw (un-normalised) for next step
+
+        hist_t = torch.stack(hist, dim=1)  # (B, obs_horizon, obs_dim)
+        if self.obs_mean is not None:
+            hist_t = (hist_t - self.obs_mean) / self.obs_std
+        obs_cond = hist_t.flatten(start_dim=1)
+
         B = cur.shape[0]
         naction = torch.randn((B, self.pred_horizon, self.act_dim), device=self.device)
         for k in self.scheduler.timesteps:
@@ -79,11 +88,15 @@ def load_dp(checkpoint, sample_obs, action_space, device,
     net_sd = {k.replace("noise_pred_net.", "", 1): v for k, v in sd.items()
               if k.startswith("noise_pred_net.")}
     net.load_state_dict(net_sd)
+    # Load per-feature normalisation stats saved as Agent buffers (None for old checkpoints).
+    obs_mean = sd.get("obs_mean", None)
+    obs_std  = sd.get("obs_std",  None)
     scheduler = DDPMScheduler(num_train_timesteps=num_diffusion_iters,
                               beta_schedule="squaredcos_cap_v2", clip_sample=True,
                               prediction_type="epsilon")
     return _DPPolicy(net, scheduler, obs_horizon, pred_horizon, act_dim, device,
-                     num_inference_steps=num_inference_steps)
+                     num_inference_steps=num_inference_steps,
+                     obs_mean=obs_mean, obs_std=obs_std)
 
 
 # --------------------------------------------------------------------------- #

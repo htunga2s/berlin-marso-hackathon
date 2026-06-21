@@ -141,6 +141,14 @@ class SmallDemoDataset_DiffusionPolicy(Dataset): # Load everything into GPU memo
 
         self.trajectories = trajectories
 
+        # Compute per-feature mean/std over all observations for normalisation.
+        # Shape: (N, obs_dim) where N is the total number of time-steps across all trajectories.
+        all_obs = torch.cat(trajectories['observations'], dim=0)  # includes the terminal obs
+        self.obs_mean = all_obs.mean(dim=0)   # (obs_dim,)
+        self.obs_std  = all_obs.std(dim=0).clamp(min=1e-6)  # (obs_dim,)  clamp avoids /0 on constant dims
+        print(f"Obs normalisation: mean=[{self.obs_mean[:4].tolist()}...] "
+              f"std=[{self.obs_std[:4].tolist()}...]")
+
     def __getitem__(self, index):
         traj_idx, start, end = self.slices[index]
         L, act_dim = self.trajectories['actions'][traj_idx].shape
@@ -177,6 +185,7 @@ class Agent(nn.Module):
         assert (env.single_action_space.high == 1).all() and (env.single_action_space.low == -1).all()
         # denoising results will be clipped to [-1,1], so the action should be in [-1,1] as well
         self.act_dim = env.single_action_space.shape[0]
+        obs_dim = env.single_observation_space.shape[1]
 
         self.noise_pred_net = ConditionalUnet1D(
             input_dim=self.act_dim, # act_horizon is not used (U-Net doesn't care)
@@ -192,12 +201,24 @@ class Agent(nn.Module):
             clip_sample=True, # clip output to [-1,1] to improve stability
             prediction_type='epsilon' # predict noise (instead of denoised action)
         )
+        # Observation normalisation buffers (initialised to identity; set via set_normalizer).
+        # Stored as buffers so they are saved/loaded with the checkpoint automatically.
+        self.register_buffer('obs_mean', torch.zeros(obs_dim))
+        self.register_buffer('obs_std',  torch.ones(obs_dim))
+
+    def set_normalizer(self, mean: torch.Tensor, std: torch.Tensor):
+        self.obs_mean.copy_(mean.to(self.obs_mean.device))
+        self.obs_std.copy_(std.to(self.obs_std.device))
+
+    def _normalize_obs(self, obs_seq):
+        # obs_seq: (B, obs_horizon, obs_dim) — broadcast mean/std over batch and horizon
+        return (obs_seq - self.obs_mean) / self.obs_std
 
     def compute_loss(self, obs_seq, action_seq):
         B = obs_seq.shape[0]
 
-        # observation as FiLM conditioning
-        obs_cond = obs_seq.flatten(start_dim=1) # (B, obs_horizon * obs_dim)
+        # observation as FiLM conditioning (normalise first)
+        obs_cond = self._normalize_obs(obs_seq).flatten(start_dim=1) # (B, obs_horizon * obs_dim)
 
         # sample noise to add to actions
         noise = torch.randn((B, self.pred_horizon, self.act_dim), device=device)
@@ -220,16 +241,10 @@ class Agent(nn.Module):
         return F.mse_loss(noise_pred, noise)
 
     def get_action(self, obs_seq):
-        # init scheduler
-        # self.noise_scheduler.set_timesteps(self.num_diffusion_iters)
-        # set_timesteps will change noise_scheduler.timesteps is only used in noise_scheduler.step()
-        # noise_scheduler.step() is only called during inference
-        # if we use DDPM, and inference_diffusion_steps == train_diffusion_steps, then we can skip this
-
         # obs_seq: (B, obs_horizon, obs_dim)
         B = obs_seq.shape[0]
         with torch.no_grad():
-            obs_cond = obs_seq.flatten(start_dim=1) # (B, obs_horizon * obs_dim)
+            obs_cond = self._normalize_obs(obs_seq).flatten(start_dim=1) # (B, obs_horizon * obs_dim)
 
             # initialize action from Guassian noise
             noisy_action_seq = torch.randn((B, self.pred_horizon, self.act_dim), device=obs_seq.device)
@@ -355,11 +370,16 @@ if __name__ == "__main__":
         num_training_steps=args.total_iters,
     )
 
+    # Observation normalisation — set mean/std computed from the demo dataset on both agents.
+    # The buffers are included in state_dict(), so they are saved and loaded with every checkpoint.
+    agent.set_normalizer(dataset.obs_mean, dataset.obs_std)
+
     # Exponential Moving Average
     # accelerates training and improves stability
     # holds a copy of the model weights
     ema = EMAModel(parameters=agent.parameters(), power=0.75)
     ema_agent = Agent(envs, args).to(device)
+    ema_agent.set_normalizer(dataset.obs_mean, dataset.obs_std)
 
     best_eval_metrics = defaultdict(float)
     timings = defaultdict(float)
@@ -418,6 +438,7 @@ if __name__ == "__main__":
         last_tick = time.time()
         optimizer.zero_grad()
         total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=1.0)
         optimizer.step()
         lr_scheduler.step()  # step lr scheduler every batch, this is different from standard pytorch behavior
         timings["backward"] += time.time() - last_tick
